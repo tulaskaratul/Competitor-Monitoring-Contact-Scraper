@@ -6,7 +6,7 @@ This project is designed for **market intelligence, competitor tracking, and lea
 
 ---
 
-## 🔥 What This Project Does (In Plain English)
+## 🔥 What This Project Does 
 
 1. Reads **Google Alerts RSS feeds** (not email)
 2. Unwraps Google redirect URLs to real article links
