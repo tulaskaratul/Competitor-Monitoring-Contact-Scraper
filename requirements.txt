@@ -1,0 +1,2 @@
+pip install feedparser newspaper3k beautifulsoup4 pandas pyyaml tldextract
+pip install requests beautifulsoup4 phonenumbers lxml tldextract
