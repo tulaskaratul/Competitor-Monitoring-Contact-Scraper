@@ -1,128 +1,224 @@
 import yaml
+import re
+import time
+import requests
+import feedparser
+import tldextract
 from datetime import datetime
-
-from fetch_rss import fetch_articles
-from extract_article import extract_content
-from company_resolver import extract_domain
-from exporter import export_csv
-from url_utils import unwrap_google_url
-from contact_scraper import scrape_contact_for_domain
+from urllib.parse import urlparse, parse_qs, unquote, urljoin
+from bs4 import BeautifulSoup
+import pandas as pd
+import phonenumbers
 
 
+# ==============================
+# CONFIG
+# ==============================
 def load_yaml(path, key):
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-        return data.get(key, [])
+        return yaml.safe_load(f).get(key, [])
 
 
-# --------------------
-# Load config
-# --------------------
-rss_urls = load_yaml("config/rss_feeds.yaml", "feeds")
-keywords = [k.lower() for k in load_yaml("config/keywords.yaml", "keywords")]
+RSS_FEEDS = load_yaml("config/rss_feeds.yaml", "feeds")
+KEYWORDS = [k.lower() for k in load_yaml("config/keywords.yaml", "keywords")]
+PUBLISHERS = set(load_yaml("config/publishers.yaml", "publishers"))
 
-print("RSS URLs loaded:", len(rss_urls))
-print("Keywords loaded:", keywords)
 
-# --------------------
-# Fetch RSS items
-# --------------------
-articles = fetch_articles(rss_urls)
-print("Total RSS items:", len(articles))
+# ==============================
+# UTILITIES
+# ==============================
+def unwrap_google_url(url):
+    qs = parse_qs(urlparse(url).query)
+    return unquote(qs["url"][0]) if "url" in qs else url
 
-if not articles:
-    print("❌ No items found in RSS feeds.")
-    exit(0)
 
-news_rows = []
+def extract_domain(url):
+    ext = tldextract.extract(url)
+    return f"{ext.domain}.{ext.suffix}"
+
+
+# ==============================
+# ARTICLE EXTRACTION
+# ==============================
+def extract_article(url):
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "lxml")
+        title = soup.title.text.strip() if soup.title else ""
+        text = " ".join(p.get_text(" ", strip=True) for p in soup.find_all("p"))
+        return title, text
+    except Exception:
+        return "", ""
+
+
+# ==============================
+# ENTITY EXTRACTION (STRICT)
+# ==============================
+BLACKLIST_TERMS = {
+    "ministry", "government", "india", "policy",
+    "scheme", "award", "department", "authority"
+}
+
+
+def extract_companies(text):
+    """
+    Returns ONLY potential operating companies.
+    If empty → article is ignored.
+    """
+    candidates = set()
+    pattern = r"\b[A-Z][A-Za-z&.\- ]{2,}\b"
+
+    for match in re.findall(pattern, text):
+        name = match.strip()
+        lname = name.lower()
+
+        if len(name.split()) < 2:
+            continue
+        if any(b in lname for b in BLACKLIST_TERMS):
+            continue
+        if any(pub in lname for pub in PUBLISHERS):
+            continue
+
+        candidates.add(name)
+
+    return list(candidates)
+
+
+# ==============================
+# WEBSITE RESOLUTION
+# ==============================
+def resolve_website(company):
+    try:
+        q = f"https://www.google.com/search?q={company}+official+website"
+        r = requests.get(q, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(r.text, "lxml")
+
+        for a in soup.select("a"):
+            href = a.get("href", "")
+            if href.startswith("http") and "google" not in href:
+                return href
+    except Exception:
+        pass
+
+    return None
+
+
+# ==============================
+# CONTACT SCRAPER
+# ==============================
+CONTACT_PATHS = ["/contact", "/contact-us", "/about", "/about-us"]
+
+def scrape_contact(domain):
+    base = f"https://{domain}"
+    emails, phones, addresses = set(), set(), set()
+
+    for path in CONTACT_PATHS:
+        try:
+            r = requests.get(urljoin(base, path), timeout=10,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(r.text, "lxml")
+            text = soup.get_text("\n")
+
+            emails.update(re.findall(
+                r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text))
+
+            for m in phonenumbers.PhoneNumberMatcher(text, "IN"):
+                phones.add(phonenumbers.format_number(
+                    m.number, phonenumbers.PhoneNumberFormat.INTERNATIONAL))
+
+            for line in text.split("\n"):
+                if "address" in line.lower():
+                    addresses.add(line.strip())
+
+            if emails or phones:
+                break
+
+            time.sleep(1)
+
+        except Exception:
+            continue
+
+    return {
+        "emails": "; ".join(sorted(emails)),
+        "phones": "; ".join(sorted(phones)),
+        "addresses": "; ".join(sorted(addresses))
+    }
+
+
+# ==============================
+# PIPELINE
+# ==============================
 companies = {}
+news_rows = []
 
-# --------------------
-# Process articles
-# --------------------
-for item in articles:
-    raw_url = item["link"]
-    real_url = unwrap_google_url(raw_url)
+for feed in RSS_FEEDS:
+    entries = feedparser.parse(feed).entries
 
-    print("\nProcessing:", real_url)
+    for item in entries:
+        real_url = unwrap_google_url(item.link)
+        title, text = extract_article(real_url)
+        combined = f"{item.title.lower()} {title.lower()} {text.lower()}"
 
-    content = extract_content(real_url)
+        if not any(k in combined for k in KEYWORDS):
+            continue
 
-    rss_title = (item.get("title") or "").lower()
-    extracted_title = (content.get("title") or "").lower() if content else ""
-    extracted_text = (content.get("text") or "").lower() if content else ""
+        extracted_companies = extract_companies(text)
 
-    combined_text = " ".join([rss_title, extracted_title, extracted_text])
+        # 🔴 HARD STOP: no companies → ignore article
+        if not extracted_companies:
+            continue
 
-    if not any(k in combined_text for k in keywords):
-        print("⏭️ Skipped (no keyword match)")
-        continue
+        news_rows.append({
+            "article": real_url,
+            "title": item.title,
+            "published": item.get("published", "")
+        })
 
-    domain = extract_domain(real_url)
-    now = datetime.utcnow().isoformat()
+        for company in extracted_companies:
+            website = resolve_website(company)
+            if not website:
+                continue
 
-    # ---- news table ----
-    news_rows.append({
+            domain = extract_domain(website)
+
+            # 🔴 FINAL SAFETY CHECK
+            if domain in PUBLISHERS:
+                continue
+
+            now = datetime.utcnow().isoformat()
+
+            companies.setdefault(domain, {
+                "company_name": company,
+                "domain": domain,
+                "website": website,
+                "first_seen": now,
+                "last_seen": now,
+                "confidence": "Medium"
+            })
+
+
+# ==============================
+# CONTACT SCRAPING
+# ==============================
+contacts = []
+for domain, c in companies.items():
+    print("Contact scrape →", domain)
+    contact = scrape_contact(domain)
+
+    contacts.append({
+        "company_name": c["company_name"],
         "domain": domain,
-        "title": item.get("title"),
-        "url": real_url,
-        "publish_date": item.get("published"),
-        "matched_keywords": ", ".join([k for k in keywords if k in combined_text])
+        "website": c["website"],
+        **contact
     })
 
-    # ---- company table ----
-    if domain not in companies:
-        companies[domain] = {
-            "domain": domain,
-            "first_seen": now,
-            "last_seen": now,
-            "confidence": "Low"
-        }
-    else:
-        companies[domain]["last_seen"] = now
 
+# ==============================
+# EXPORT
+# ==============================
+pd.DataFrame(news_rows).to_csv("data/processed/news.csv", index=False)
+pd.DataFrame(companies.values()).to_csv("data/processed/companies.csv", index=False)
+pd.DataFrame(contacts).to_csv("data/processed/contacts.csv", index=False)
 
-# --------------------
-# Export NEWS + COMPANIES
-# --------------------
-if news_rows:
-    export_csv(news_rows, "data/processed/news.csv")
-    print(f"\n✅ news.csv written ({len(news_rows)} rows)")
-else:
-    print("\n⚠️ news.csv NOT written")
-
-if companies:
-    export_csv(list(companies.values()), "data/processed/companies.csv")
-    print(f"✅ companies.csv written ({len(companies)} rows)")
-else:
-    print("⚠️ companies.csv NOT written")
-
-
-# --------------------
-# Scrape CONTACT pages
-# --------------------
-print("\n🔍 Scraping contact pages...\n")
-
-contacts_rows = []
-
-for domain in companies.keys():
-    print(f"Contact scrape → {domain}")
-    result = scrape_contact_for_domain(domain)
-
-    contacts_rows.append({
-        "domain": domain,
-        "emails": "; ".join(result["emails"]),
-        "phones": "; ".join(result["phones"]),
-        "addresses": "; ".join(result["addresses"])
-    })
-
-# --------------------
-# Export CONTACTS
-# --------------------
-if contacts_rows:
-    export_csv(contacts_rows, "data/processed/contacts.csv")
-    print(f"\n✅ contacts.csv written ({len(contacts_rows)} rows)")
-else:
-    print("\n⚠️ contacts.csv NOT written")
-
-print("\n🎯 Run complete")
+print("✅ Clean competitor-only data generated")
+print("🎯 No publishers included")
